@@ -1,0 +1,85 @@
+# Dice Chess Reference Bot
+
+[![CI](https://github.com/fortemate/dicechess-reference-bot/actions/workflows/ci.yaml/badge.svg)](https://github.com/fortemate/dicechess-reference-bot/actions/workflows/ci.yaml)
+[![Play Live](https://img.shields.io/badge/Play-Live-success)](https://fortemate.com/)
+[![Leaderboard](https://img.shields.io/badge/Ladder-Leaderboard-1E90FF)](https://fortemate.com/leaderboard)
+[![License: MIT](https://img.shields.io/badge/License-MIT-lightgrey)](./LICENSE)
+
+Reference bot **and starter-kit** for the **Dice Chess Bot API** — fork it, replace one method, and you have your own bot. JVM (Scala 3), wraps the [Dice Chess engine](https://github.com/fortemate/dicechess-engine) and plays via [`dicechess-play-api`](https://github.com/fortemate/dicechess-play-api)'s Lichess-shaped Bot API ([full API reference](https://fortemate.com/)).
+
+## What it does
+
+- Authenticates with a bot token and listens on `GET /bot/stream/event`.
+- Accepts incoming challenges, and on `gameStart` streams the game (`GET /bot/game/stream/{id}`) and, on each of its own dice rolls, computes a turn and submits it (`POST /bot/game/{id}/move`).
+- Reconnects the long-lived streams; the move call is fire-and-forget (the outcome arrives on the stream).
+- Resumes on startup: `GET /bot/games` lists every live game the caller is seated in, so a registered bot picks its in-flight games back up after a restart instead of forfeiting them on time.
+
+It never needs to know its colour **to be correct**: the move endpoint resolves the bot's seat server-side, so reacting to every roll is always safe — the server applies the move only on this bot's turn (off-turn submissions are harmlessly rejected). Knowing the colour is only an optimisation: the game stream carries both sides' rolls, so the bot reads its own seat once per game from `GET /bot/games` and skips the search on the opponent's rolls — halving the search work. If that lookup fails the bot simply searches on every roll again, as it always did.
+
+## Quickstart (play the house bot, no registration)
+
+```bash
+# 1. Mint an ephemeral anonymous token (unranked, zero registration)
+T=$(curl -sX POST 'https://api.fortemate.com/bot/anon?name=mybot' | jq -r .token)
+
+# 2. Run the bot against the live API; challenge the always-on house bot on startup
+BOT_TOKEN=$T PLAY_API_BASE_URL=https://api.fortemate.com BOT_CHALLENGE='house|greedy' sbt run
+```
+
+You'll see the challenge, the game start, and each submitted turn logged. (Locally, point `PLAY_API_BASE_URL` at your own `sbt run` of `dicechess-play-api` and use a `PLAY_BOT_TOKENS` entry.)
+
+## Write your own bot
+
+The whole client — auth, the account/game ndjson streams, reconnect, move submission, turn de-duplication — is handled for you. **You implement one method:**
+
+```scala
+trait Strategy:
+  /** Return the turn's micro-moves in UCI — one per die you use — or None to pass when there is no
+    * legal move. The MoveContext carries the gameId (keep per-game state / tag logs), the DFEN
+    * (position + rolled dice for the side to move), and the clock (your remaining time and the
+    * opponent's, or None for an unlimited game). */
+  def chooseMoves(ctx: MoveContext): Option[List[String]]
+```
+
+The default [`EngineStrategy`](src/main/scala/dicechess/refbot/Strategy.scala) asks the dice-chess engine. To build your bot:
+
+1. Implement your own `Strategy` (your move-choosing logic).
+2. Swap it into `Main` — `ReferenceBot(config, client, supervisor, MyStrategy())`.
+
+That's it; you don't touch transport, streaming, or auth. (DFEN = standard FEN plus a 7th field listing the rolled dice as piece letters; you move a piece of each die's type. Legality is the same engine the server validates with, so a move your `Strategy` returns is accepted iff it's legal.)
+
+## Configuration (environment)
+
+| Var | Default | Meaning |
+|---|---|---|
+| `PLAY_API_BASE_URL` | `http://localhost:8080` | The play-api base URL (e.g. `https://api.fortemate.com`) |
+| `BOT_TOKEN` | — | The bot's Bearer token (anonymous via `POST /bot/anon`, or a `PLAY_BOT_TOKENS` entry) |
+| `OPENING_BOOK_PATH` | — | Optional path to a TSV opening book file (`sample_opening_book.tsv` is provided as an example) |
+| `BOT_ALGORITHM` | `greedy` | Engine search algorithm (used by the default `EngineStrategy`) |
+| `BOT_CHALLENGE` | — | Optional `team\|name` to challenge on startup (e.g. `house\|greedy`) |
+| `BOT_OPEN_SEEKS` | `0` | Standing lobby seeks to keep open, so humans browsing the lobby always find this bot to play |
+| `BOT_SEEK_TIME_CONTROL` | — | Optional seek time control, e.g. `10+10` (Fischer) or `10` (Sudden Death) |
+
+## Self-play (local)
+
+Run your own `dicechess-play-api` with two static tokens (`PLAY_BOT_TOKENS='me|a|tokA,me|b|tokB'`), then start two instances — set `BOT_CHALLENGE='me|b'` on the first so it opens the game; both accept and play to a finish. (On the live API, anonymous bots get uuid-based names, so prefer challenging the house bot for a quick demo.)
+
+## Container
+
+CI publishes a multi-arch image to `ghcr.io/fortemate/dicechess-reference-bot` on every push to `main` (and tagged `vX.Y.Z` on release). Run it next to the play-api via `docker-compose.yaml` — set `BOT_TOKEN`, `PLAY_API_BASE_URL`, `BOT_ALGORITHM`, and `OPENING_BOOK_PATH` in `.env`:
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+The bot is an outbound client (no listening port); it reconnects to the play-api and plays whatever challenges arrive.
+
+## Stack
+
+Scala 3 · cats-effect · fs2 · http4s-ember-client · Circe · the dice-chess engine (JVM). Same toolchain as `dicechess-play-api`.
+
+## License
+
+[MIT](./LICENSE) — fork it, modify it, keep your bot private. This repository is a template, and its code carries no copyleft obligations.
+
+One honest caveat: the bot as shipped links the AGPL-3.0 [dice-chess engine](https://github.com/fortemate/dicechess-engine) for move selection, so if you distribute a bot that still links the engine, the AGPL applies to that combination. To stay fully permissive, replace the engine with your own move logic — the server sends the complete legal-move tree over the wire (`legalMoves` in the game state, or `GET /games/{id}/moves`), so the engine is not required for rule-correct play.

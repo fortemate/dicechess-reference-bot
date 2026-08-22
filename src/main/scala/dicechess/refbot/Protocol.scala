@@ -1,0 +1,126 @@
+package dicechess.refbot
+
+import io.circe.generic.semiauto.deriveCodec
+import io.circe.{Codec, Decoder, Encoder}
+
+/** The Bot API wire vocabulary, mirroring dicechess-play-api's protocol so the bot speaks the same JSON. Only what the
+  * bot sends or receives is modelled here.
+  */
+object Protocol:
+
+  enum Side:
+    case White, Black
+
+  enum Seat:
+    case White, Black, Spectator
+
+  enum Principal:
+    case Guest(id: String)
+    case User(id: String)
+    case Bot(team: String, name: String)
+
+  enum Termination:
+    case KingCaptured, Resign, Draw, Aborted, Timeout
+
+  enum GameResult:
+    case Win(side: Side)
+    case Draw
+
+  final case class GameOver(result: GameResult, termination: Termination)
+
+  enum GameStatus:
+    case Active
+    case Ended(over: GameOver)
+
+  /** A game's time control (mirrors the server ADT). Carries the Fischer increment the bot needs to budget. */
+  enum TimeControl:
+    case Unlimited
+    case SuddenDeath(initialSeconds: Int)
+    case Fischer(initialSeconds: Int, incrementSeconds: Int)
+    case PerMove(secondsPerMove: Int)
+
+  /** Remaining time per side, in milliseconds, as of the carrying event. Absent (`null`) for unlimited games. */
+  final case class Clocks(white: Long, black: Long)
+
+  final case class PublicGameState(
+      version: Long,
+      dfen: String,
+      activeSeat: Seat,
+      dicePending: Boolean,
+      status: GameStatus,
+      clocks: Option[Clocks],
+      timeControl: Option[TimeControl]
+  )
+
+  /** Events on a game's stream (`GET /bot/game/stream/{id}`). */
+  enum GameEvent:
+    case Snapshot(v: Long, state: PublicGameState)
+    case DiceRolled(v: Long, seat: Seat, dice: List[Int], dfen: String, clocks: Option[Clocks])
+    case TurnPlayed(v: Long, seat: Seat, moves: List[String], fenAfter: String)
+    case GameEnded(v: Long, over: GameOver)
+    case Rejected(v: Long, seat: Seat, reason: String)
+
+  /** Events on the account stream (`GET /bot/stream/event`). */
+  enum BotEvent:
+    case ChallengeReceived(id: String, challenger: Principal)
+    case ChallengeDeclined(id: String)
+    case GameStart(gameId: String)
+
+  final case class Challenge(id: String, challenger: Principal, target: Principal)
+  final case class BotGame(gameId: String)
+
+  /** One entry of `GET /bot/games`. The server sends more (`activeSeat`, `dicePending`, `timeControl`, `clocks`,
+    * `version`) — deliberately not modelled, because the game stream already carries all of it live. What only this
+    * listing knows is `seat`: which side the *caller* holds, the one thing the event stream never says.
+    */
+  final case class BotActiveGame(gameId: String, seat: Seat)
+
+  /** `GET /bot/games` 200: every live game the caller is seated in. */
+  final case class BotGames(games: List[BotActiveGame])
+
+  final case class ChallengeTarget(team: String, name: String)
+  final case class BotMove(moves: List[String])
+
+  /** A post-commit client dice seed (provably-fair, #13): the bot's entropy contribution, folded into every roll. */
+  final case class BotSeed(seed: String)
+
+  /** `POST /bot/seeks` 201: the standing lobby offer's public id plus the capability secret that polls/cancels it. */
+  final case class CreatedSeek(seekId: String, secret: String)
+
+  /** `GET /lobby/seeks/{id}?secret=` 200: still open, or matched with the seated game's id. (The `token` field is the
+    * creator's WebSocket seat token — bots are seated by principal and never need it.)
+    */
+  final case class SeekState(matched: Boolean, gameId: Option[String], token: Option[String])
+
+  // ── codecs ──────────────────────────────────────────────────────────────────
+
+  // Total, exception-free enum codec: decode by case name, encode as the case name.
+  private def nameCodec[A](label: String, values: Array[A]): Codec[A] =
+    val byName = values.iterator.map(v => v.toString -> v).toMap
+    Codec.from(
+      Decoder.decodeString.emap(s => byName.get(s).toRight(s"invalid $label: $s")),
+      Encoder.encodeString.contramap(_.toString)
+    )
+
+  given Codec[Side]        = nameCodec("Side", Side.values)
+  given Codec[Seat]        = nameCodec("Seat", Seat.values)
+  given Codec[Termination] = nameCodec("Termination", Termination.values)
+
+  given Codec[GameResult]      = deriveCodec
+  given Codec[GameOver]        = deriveCodec
+  given Codec[GameStatus]      = deriveCodec
+  given Codec[TimeControl]     = deriveCodec
+  given Codec[Clocks]          = deriveCodec
+  given Codec[Principal]       = deriveCodec
+  given Codec[PublicGameState] = deriveCodec
+  given Codec[GameEvent]       = deriveCodec
+  given Codec[BotEvent]        = deriveCodec
+  given Codec[Challenge]       = deriveCodec
+  given Codec[BotGame]         = deriveCodec
+  given Codec[BotActiveGame]   = deriveCodec
+  given Codec[BotGames]        = deriveCodec
+  given Codec[ChallengeTarget] = deriveCodec
+  given Codec[BotMove]         = deriveCodec
+  given Codec[BotSeed]         = deriveCodec
+  given Codec[CreatedSeek]     = deriveCodec
+  given Codec[SeekState]       = deriveCodec

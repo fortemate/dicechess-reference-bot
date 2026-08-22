@@ -1,0 +1,96 @@
+package dicechess.refbot
+
+import dicechess.refbot.Protocol.*
+import dicechess.refbot.Protocol.given
+import io.circe.parser.decode
+import io.circe.syntax.*
+
+class ProtocolSuite extends munit.FunSuite:
+
+  private def roundtrip[A: io.circe.Codec](value: A): Unit =
+    assertEquals(decode[A](value.asJson.noSpaces), Right(value))
+
+  test("bot events round-trip"):
+    roundtrip[BotEvent](BotEvent.ChallengeReceived("c1", Principal.Bot("acme", "alice")))
+    roundtrip[BotEvent](BotEvent.GameStart("g1"))
+    roundtrip[BotEvent](BotEvent.ChallengeDeclined("c1"))
+
+  test("game events round-trip"):
+    roundtrip[GameEvent](GameEvent.DiceRolled(1L, Seat.White, List(1, 2, 6), "dfen", Some(Clocks(180000, 175000))))
+    roundtrip[GameEvent](GameEvent.DiceRolled(2L, Seat.Black, List(4), "dfen", None))
+    roundtrip[GameEvent](GameEvent.GameEnded(9L, GameOver(GameResult.Win(Side.Black), Termination.KingCaptured)))
+
+  // Pin compatibility with the exact JSON dicechess-play-api emits, so a server-side codec change
+  // that would break this bot fails here.
+  test("decodes the play-api wire shapes the bot consumes"):
+    assertEquals(decode[BotEvent]("""{"GameStart":{"gameId":"g1"}}"""), Right(BotEvent.GameStart("g1")))
+    // Timed game: clocks present (remaining ms per side).
+    assertEquals(
+      decode[GameEvent](
+        """{"DiceRolled":{"v":1,"seat":"White","dice":[2,3,6],"dfen":"fen","clocks":{"white":180000,"black":175000}}}"""
+      ),
+      Right(GameEvent.DiceRolled(1L, Seat.White, List(2, 3, 6), "fen", Some(Clocks(180000, 175000))))
+    )
+    // Unlimited game: clocks null.
+    assertEquals(
+      decode[GameEvent]("""{"DiceRolled":{"v":1,"seat":"White","dice":[2,3,6],"dfen":"fen","clocks":null}}"""),
+      Right(GameEvent.DiceRolled(1L, Seat.White, List(2, 3, 6), "fen", None))
+    )
+    // Snapshot carries the time control (the only event that does) — the bot needs the Fischer increment to budget.
+    val snapshot = decode[GameEvent](
+      """{"Snapshot":{"v":0,"state":{"version":0,"dfen":"fen","activeSeat":"White","dicePending":true,"status":{"Active":{}},"clocks":{"white":300000,"black":300000},"timeControl":{"Fischer":{"initialSeconds":300,"incrementSeconds":3}}}}}"""
+    )
+    assertEquals(
+      snapshot.toOption.collect { case GameEvent.Snapshot(_, s) => s.timeControl },
+      Some(Some(TimeControl.Fischer(300, 3)))
+    )
+    // Forward-compat: the server now adds provably-fair fields (commit on every snapshot; seed/clientSeeds on the
+    // reveal) that the bot does not model. Circe must ignore the extras rather than fail to decode.
+    assertEquals(
+      decode[GameEvent](
+        """{"GameEnded":{"v":9,"over":{"result":{"Win":{"side":"Black"}},"termination":"KingCaptured"},"seed":"ab12","clientSeeds":{"white":"w","black":"b"}}}"""
+      ),
+      Right(GameEvent.GameEnded(9L, GameOver(GameResult.Win(Side.Black), Termination.KingCaptured)))
+    )
+    val snapshotWithReveal = decode[GameEvent](
+      """{"Snapshot":{"v":0,"state":{"version":0,"dfen":"fen","activeSeat":"White","dicePending":true,"status":{"Active":{}},"clocks":null,"timeControl":{"Unlimited":{}},"commit":"c0ffee","seed":null,"clientSeeds":null}}}"""
+    )
+    assert(
+      snapshotWithReveal.isRight,
+      s"a snapshot carrying the new reveal fields must still decode: $snapshotWithReveal"
+    )
+
+  test("encodes what the bot sends"):
+    assertEquals(BotMove(List("e2e4", "g1f3")).asJson.noSpaces, """{"moves":["e2e4","g1f3"]}""")
+    assertEquals(ChallengeTarget("acme", "bob").asJson.noSpaces, """{"team":"acme","name":"bob"}""")
+    assertEquals(BotSeed("deadbeefdeadbeef").asJson.noSpaces, """{"seed":"deadbeefdeadbeef"}""")
+
+  // GET /bot/games — the only place the wire says which seat WE hold. Play-api's BotActiveGame carries five more
+  // fields the bot deliberately ignores; pinning the real payload proves the subset still decodes.
+  test("decodes the caller's own seat out of the /bot/games listing"):
+    assertEquals(
+      decode[BotGames](
+        """{"games":[{"gameId":"g1","seat":"Black","activeSeat":"White","dicePending":true,""" +
+          """"timeControl":{"Fischer":{"initialSeconds":300,"incrementSeconds":3}},""" +
+          """"clocks":{"white":300000,"black":300000},"version":3}]}"""
+      ),
+      Right(BotGames(List(BotActiveGame("g1", Seat.Black))))
+    )
+    // No live games (e.g. the listing raced ahead of the game) — an empty list, not an error.
+    assertEquals(decode[BotGames]("""{"games":[]}"""), Right(BotGames(Nil)))
+
+  test("decodes the seek-keeper wire (#14): the created seek and both status shapes"):
+    // POST /bot/seeks 201 — exactly what play-api's CreatedSeek emits.
+    assertEquals(
+      decode[CreatedSeek]("""{"seekId":"seek-12","secret":"cafe0123"}"""),
+      Right(CreatedSeek("seek-12", "cafe0123"))
+    )
+    // GET /lobby/seeks/{id}?secret= — open, then matched (the token is the creator's WS seat token; unused by bots).
+    assertEquals(
+      decode[SeekState]("""{"matched":false,"gameId":null,"token":null}"""),
+      Right(SeekState(matched = false, None, None))
+    )
+    assertEquals(
+      decode[SeekState]("""{"matched":true,"gameId":"game-uuid","token":"tok-w"}"""),
+      Right(SeekState(matched = true, Some("game-uuid"), Some("tok-w")))
+    )

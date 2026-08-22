@@ -1,0 +1,426 @@
+package dicechess.refbot
+
+import cats.effect.{IO, Ref, Resource}
+import cats.effect.std.Supervisor
+import cats.syntax.all.*
+import dicechess.refbot.Protocol.*
+import dicechess.refbot.Protocol.given
+import fs2.Stream
+import io.circe.Decoder
+import io.circe.parser.decode
+import io.circe.syntax.*
+import org.http4s.Method.*
+import org.http4s.circe.CirceEntityCodec.given
+import org.http4s.client.{Client, UnexpectedStatus}
+import org.http4s.client.dsl.io.*
+import org.http4s.headers.Authorization
+import org.http4s.{AuthScheme, Credentials, Request, Response, Status}
+
+import java.security.SecureRandom
+import scala.concurrent.duration.*
+
+/** Per-game memory: the highest game-event version already handled (turn de-duplication), the time control, which rides
+  * only on the Snapshot yet is needed to budget the increment on later DiceRolled turns, and the seat this bot holds —
+  * `None` when it could not be resolved (see [[ReferenceBot.ownSeat]]).
+  */
+final private case class GameMemory(handled: Long, timeControl: Option[TimeControl], ownSeat: Option[Seat])
+
+/** A Lichess-bot-style client of the Dice Chess Bot API: it listens on the account stream, accepts incoming challenges,
+  * and plays each game with the engine.
+  *
+  * It never needs to know which colour it holds *to be correct*: the move endpoint resolves the bot's seat server-side,
+  * so reacting to every dice roll is always safe — the server applies the move only when it is in fact this bot's turn
+  * (off-turn submissions are harmlessly rejected). Knowing the seat is purely an optimisation, and the code treats it
+  * as one: it looks the seat up once per game to skip the search on the opponent's rolls, and if the lookup fails it
+  * falls back to searching on every roll rather than freezing.
+  */
+final class ReferenceBot(config: Config, client: Client[IO], supervisor: Supervisor[IO], strategy: Strategy):
+
+  private val auth = Authorization(Credentials.Token(AuthScheme.Bearer, config.token))
+
+  // One shared, thread-safe CSPRNG for dice seeds (reused across games rather than re-seeded per call).
+  private val rng = SecureRandom()
+
+  /** Standing-seek refresh cadence — comfortably under the server's ~2-minute bot-seek TTL. */
+  private val SeekPollInterval: FiniteDuration = 45.seconds
+
+  // Unary calls (challenge / accept / move) fast-fail on a short timeout; the base `client` stays untimed
+  // (Main sets withTimeout(Inf)) for the long-lived ndjson streams.
+  private def fireUnary(request: Request[IO]): IO[Unit] = client.status(request).timeout(10.seconds).void
+
+  /** React to account events forever, with game resumption, the optional opening challenge, and the standing-seek
+    * keeper running in the background once the account stream is up (so we don't miss our own gameStart).
+    *
+    * The account-stream connection is opened (request sent, response headers received) *before* those background tasks
+    * start: `resumeGames`' `/bot/games` snapshot is only a reliable substitute for a missed `GameStart` if the stream
+    * is already subscribed by the time that snapshot is taken — otherwise a game starting in the gap between the
+    * snapshot and the subscription is caught by neither and quietly times out.
+    */
+  def run: IO[Unit] =
+    Ref
+      .of[IO, Set[String]](Set.empty)
+      .flatMap: inFlight =>
+        IO.deferred[Unit]
+          .flatMap: streamUp =>
+            val runStream = ReferenceBot.keepAlive("account stream"):
+              accountEventsConnection.use: response =>
+                streamUp.complete(()).attempt *>
+                  resumeGames(inFlight).background.surround:
+                    ndjsonBody[BotEvent](response).evalMap(handle(_, inFlight)).compile.drain.as(true)
+
+            ((streamUp.get *> openingChallenge).background, (streamUp.get *> seekKeeper).background).tupled
+              .surround(runStream)
+
+  private def accountEventsConnection: Resource[IO, Response[IO]] =
+    val request = Request[IO](GET, config.baseUri / "bot" / "stream" / "event").putHeaders(auth)
+    client.run(request).evalMap(ReferenceBot.requireSuccessfulStreamResponse(_, request))
+
+  /** Post-restart recovery (#46): the account stream only reports a `GameStart` the moment a game begins, so a process
+    * restarted mid-game never sees it again and the game silently times out. `GET /bot/games` is the polling
+    * counterpart that lists every live game the caller is seated in regardless of when it started, so replaying it here
+    * picks each one back up through the exact same per-game stream handler a fresh `GameStart` uses — the handler's own
+    * Snapshot-first subscription and version-based de-duplication need no special-casing for a game that was already in
+    * progress. Transient lookup failures (timeout, network blip, temporary 5xx) are retried with backoff; only after
+    * that budget is exhausted does this restart forfeit any in-flight games, no worse than before this existed.
+    */
+  private def resumeGames(inFlight: Ref[IO, Set[String]]): IO[Unit] =
+    val lookup = fetch[BotGames](Request[IO](GET, config.baseUri / "bot" / "games").putHeaders(auth))
+    ReferenceBot
+      .withRetries(maxRetries = 3, initialDelay = 1.second)(lookup)
+      .flatMap:
+        case Right(listing) =>
+          listing.games.traverse_ : game =>
+            IO.println(s"[refbot] resuming game ${game.gameId} after restart") *>
+              superviseGame(game.gameId, inFlight)
+        case Left(error) =>
+          IO.println(s"[refbot] resume lookup failed (in-flight games forfeited this restart): ${describe(error)}")
+
+  private def openingChallenge: IO[Unit] =
+    config.challenge.traverse_ : (team, name) =>
+      // Brief delay so the account stream is subscribed before we challenge and the game starts.
+      IO.sleep(2.seconds) *> IO.println(s"[refbot] challenging $team|$name") *>
+        fireUnary(POST(ChallengeTarget(team, name), config.baseUri / "bot" / "challenge").putHeaders(auth))
+
+  private def handle(event: BotEvent, inFlight: Ref[IO, Set[String]]): IO[Unit] = event match
+    case BotEvent.ChallengeReceived(id, _) => IO.println(s"[refbot] accepting challenge $id") *> accept(id)
+    case BotEvent.GameStart(gameId)        =>
+      IO.println(s"[refbot] game $gameId started") *> superviseGame(gameId, inFlight)
+    case BotEvent.ChallengeDeclined(id) => IO.println(s"[refbot] challenge $id declined")
+
+  /** Supervise `playGame` for `gameId` unless it is already running. `resumeGames`' post-restart listing and a fresh
+    * `GameStart` can name the same game — one arriving while the other is still being set up — and starting `playGame`
+    * twice would double-submit a dice seed and open two competing subscriptions to the same game stream.
+    */
+  private def superviseGame(gameId: String, inFlight: Ref[IO, Set[String]]): IO[Unit] =
+    ReferenceBot
+      .claim(inFlight, gameId)
+      .flatMap: started =>
+        if !started then IO.unit
+        else supervisor.supervise(playGame(gameId).guarantee(inFlight.update(_ - gameId))).void
+
+  private def accept(id: String): IO[Unit] =
+    fireUnary(Request[IO](POST, config.baseUri / "bot" / "challenge" / id / "accept").putHeaders(auth))
+
+  // ── standing lobby seeks (#14) ──────────────────────────────────────────────
+
+  /** Keep `BOT_OPEN_SEEKS` open lobby seeks standing, so a human browsing the lobby always finds this bot to play. Each
+    * tick refreshes the held seeks (the capability poll doubles as the keep-alive under the server's bot-seek TTL) and
+    * tops the pool back up. A matched seek starts the game here — seek matches emit no `GameStart` on the account
+    * stream; this poll IS the discovery. Everything is best-effort: a server without the seek endpoints (404) or at the
+    * cap (429) just logs and retries next tick, so deploy order doesn't matter.
+    */
+  private def seekKeeper: IO[Unit] =
+    if config.openSeeks <= 0 then IO.unit
+    else
+      Ref.of[IO, Map[String, String]](Map.empty).flatMap { held =>
+        val tick = (refreshSeeks(held) *> topUpSeeks(held))
+          .handleErrorWith(e => IO.println(s"[refbot] seek keeper tick failed (retrying): $e"))
+        // Brief delay so the first tick lands after the account stream is up, then keep the pool topped forever.
+        IO.sleep(2.seconds) *> (tick *> IO.sleep(SeekPollInterval)).foreverM
+      }
+
+  /** Poll every held seek: the capability read keeps it alive server-side, reports a match (start playing, drop it —
+    * the next top-up posts a replacement), and a definitive 404 (expired / cancelled / pre-seeks server) drops it too.
+    * A transient failure (timeout, 5xx, network blip) keeps the seek held: dropping it would leak the secret while the
+    * seek stays alive server-side, and the replacement would double-post into the per-bot cap.
+    */
+  private def refreshSeeks(held: Ref[IO, Map[String, String]]): IO[Unit] =
+    held.get.flatMap(_.toList.traverse_ { (seekId, secret) =>
+      val uri = (config.baseUri / "lobby" / "seeks" / seekId).withQueryParam("secret", secret)
+      fetch[SeekState](Request[IO](GET, uri).putHeaders(auth)).flatMap {
+        case Right(state) if state.matched =>
+          held.update(_ - seekId) *>
+            state.gameId.traverse_ : gameId =>
+              IO.println(s"[refbot] seek $seekId matched -> game $gameId") *>
+                supervisor.supervise(playGame(gameId)).void
+        case Right(_)                                      => IO.unit // still open; the poll refreshed its TTL
+        case Left(UnexpectedStatus(Status.NotFound, _, _)) =>
+          IO.println(s"[refbot] seek $seekId is gone — will repost") *> held.update(_ - seekId)
+        case Left(error) =>
+          IO.println(s"[refbot] seek $seekId poll failed (keeping it): ${describe(error)}")
+      }
+    })
+
+  /** Post seeks until the pool holds the configured number. Failures (a pre-seeks server, the per-bot cap) are logged
+    * and retried next tick — the keeper must never crash the bot.
+    */
+  private def topUpSeeks(held: Ref[IO, Map[String, String]]): IO[Unit] =
+    held.get.flatMap { current =>
+      List.fill(config.openSeeks - current.size)(()).traverse_ { _ =>
+        val body = config.seekTimeControl match
+          case Some(tc) => io.circe.Json.obj("timeControl" -> tc.asJson)
+          case None     => io.circe.Json.obj()
+        fetch[CreatedSeek](POST(body, config.baseUri / "bot" / "seeks").putHeaders(auth)).flatMap {
+          case Right(created) =>
+            IO.println(s"[refbot] standing seek ${created.seekId} posted") *>
+              held.update(_.updated(created.seekId, created.secret))
+          case Left(error) => IO.println(s"[refbot] seek create failed (retrying next tick): ${describe(error)}")
+        }
+      }
+    }
+
+  /** A unary call that needs the response body, with the same short deadline as `fireUnary`. Errors stay typed so the
+    * caller can tell a definitive `UnexpectedStatus` (e.g. 404 = the seek is gone) from a transient failure.
+    */
+  private def fetch[A: Decoder](request: Request[IO]): IO[Either[Throwable, A]] =
+    client.expect[A](request)(using org.http4s.circe.jsonOf[IO, A]).timeout(10.seconds).attempt
+
+  /** A short, log-friendly rendering of a failure. */
+  private def describe(error: Throwable): String = ReferenceBot.describe(error)
+
+  /** Stream one game to its terminal, submitting a move on each fresh dice roll for our turn. Contributes this bot's
+    * dice seed first so the server's opening-roll gate can open promptly (otherwise it waits out the grace), then
+    * resolves our seat once so the opponent's rolls can be skipped. Both run before the subscription without losing
+    * anything: the stream opens with a Snapshot of the current position.
+    */
+  private def playGame(gameId: String): IO[Unit] =
+    submitSeed(gameId) *>
+      ownSeat(gameId)
+        .flatMap(seat => Ref.of[IO, GameMemory](GameMemory(handled = -1L, timeControl = None, ownSeat = seat)))
+        .flatMap: mem =>
+          ReferenceBot.keepAlive(s"game $gameId stream"):
+            ndjson[GameEvent](Request[IO](GET, config.baseUri / "bot" / "game" / "stream" / gameId).putHeaders(auth))
+              .evalTap(event => onGameEvent(gameId, mem, event))
+              .takeThrough:
+                case _: GameEvent.GameEnded => false
+                case _                      => true
+              .compile
+              .last
+              .map:
+                case Some(_: GameEvent.GameEnded) => false // terminal, don't reconnect
+                case _                            => true
+
+  /** Which seat this bot holds in `gameId`. The game stream never says — every event reports the seat it is *about* —
+    * so ask `GET /bot/games`, the one endpoint that answers from the caller's perspective.
+    *
+    * Best-effort by design: any failure (a game not yet in the listing, a blip, an older server) yields `None`, which
+    * degrades to the historical behaviour of searching on every roll. Never let this optimisation stop the bot from
+    * playing.
+    */
+  private def ownSeat(gameId: String): IO[Option[Seat]] =
+    fetch[BotGames](Request[IO](GET, config.baseUri / "bot" / "games").putHeaders(auth)).flatMap:
+      case Right(listing) =>
+        val seat = listing.games.collectFirst { case game if game.gameId == gameId => game.seat }
+        seat match
+          case Some(s) => IO.println(s"[refbot] game $gameId seated as $s").as(seat)
+          case None    => IO.println(s"[refbot] game $gameId seat unknown — searching every roll").as(None)
+      case Left(error) =>
+        IO.println(s"[refbot] game $gameId seat lookup failed (searching every roll): ${describe(error)}").as(None)
+
+  /** Contribute this bot's post-commit dice entropy (provably-fair, #13) before the opening roll. Best-effort: if it
+    * fails, the server force-starts after its grace and this seat falls back to its id, so the game still proceeds.
+    */
+  private def submitSeed(gameId: String): IO[Unit] =
+    randomSeed.flatMap: seed =>
+      IO.println(s"[refbot] game $gameId submitting dice seed") *>
+        fireUnary(POST(BotSeed(seed), config.baseUri / "bot" / "game" / gameId / "seed").putHeaders(auth))
+          .handleErrorWith(e => IO.println(s"[refbot] game $gameId seed submit failed (continuing): $e"))
+
+  /** A fresh 16-byte (128-bit) client dice seed, hex-encoded. */
+  private def randomSeed: IO[String] = IO:
+    val bytes = new Array[Byte](16)
+    rng.nextBytes(bytes)
+    bytes.map("%02x".format(_)).mkString
+
+  private def onGameEvent(gameId: String, mem: Ref[IO, GameMemory], event: GameEvent): IO[Unit] = event match
+    case GameEvent.DiceRolled(v, seat, _, dfen, clocks) =>
+      mem.get.flatMap: m =>
+        if !ReferenceBot.shouldSearch(m.ownSeat, seat) then IO.unit
+        else maybeMove(gameId, mem, v, dfen, turnClock(seat, clocks, m.timeControl))
+    case GameEvent.Snapshot(v, ps) =>
+      // The time control rides only on the Snapshot; remember it so later DiceRolled turns can carry the increment.
+      mem
+        .updateAndGet(_.copy(timeControl = ps.timeControl))
+        .flatMap: m =>
+          if !(ps.dicePending && ReferenceBot.shouldSearch(m.ownSeat, ps.activeSeat)) then IO.unit
+          else maybeMove(gameId, mem, v, ps.dfen, turnClock(ps.activeSeat, ps.clocks, ps.timeControl))
+    case GameEvent.GameEnded(_, over) =>
+      IO.println(s"[refbot] game $gameId ended: ${over.result} (${over.termination})")
+    case _ => IO.unit
+
+  /** The side-to-move's clock (with the Fischer increment from the time control), or `None` for an unlimited game. */
+  private def turnClock(toMove: Seat, clocks: Option[Clocks], timeControl: Option[TimeControl]): Option[TurnClock] =
+    val increment = timeControl match
+      case Some(TimeControl.Fischer(_, incrementSeconds)) => incrementSeconds.seconds
+      case _                                              => Duration.Zero
+    clocks.flatMap: c =>
+      toMove match
+        case Seat.White     => Some(TurnClock(c.white.millis, c.black.millis, increment))
+        case Seat.Black     => Some(TurnClock(c.black.millis, c.white.millis, increment))
+        case Seat.Spectator => None
+
+  private def maybeMove(
+      gameId: String,
+      mem: Ref[IO, GameMemory],
+      version: Long,
+      dfen: String,
+      clock: Option[TurnClock]
+  ): IO[Unit] =
+    mem
+      .modify(m => if version > m.handled then (m.copy(handled = version), true) else (m, false))
+      .flatMap: fresh =>
+        if !fresh then IO.unit
+        else
+          // Run the (CPU-bound, synchronous) strategy on the blocking pool so a slow search never starves the compute
+          // pool — that would stall the keep-alive on the long-lived ndjson streams and drop the connection.
+          IO.blocking(strategy.chooseMoves(MoveContext(gameId, dfen, clock)))
+            .flatMap:
+              case None        => IO.unit // forced pass: the server advances on its own
+              case Some(moves) => submitMove(gameId, moves)
+
+  private def submitMove(gameId: String, moves: List[String]): IO[Unit] =
+    IO.println(s"[refbot] game $gameId submitting $moves") *>
+      fireUnary(POST(BotMove(moves), config.baseUri / "bot" / "game" / gameId / "move").putHeaders(auth))
+
+  /** Decode an ndjson response body line-by-line; undecodable lines (e.g. keep-alives) are dropped. */
+  private def ndjson[A: Decoder](request: Request[IO]): Stream[IO, A] =
+    client
+      .stream(request)
+      .flatMap: response =>
+        if response.status.isSuccess then ndjsonBody[A](response)
+        else Stream.raiseError[IO](UnexpectedStatus(response.status, request.method, request.uri))
+
+  private def ndjsonBody[A: Decoder](response: Response[IO]): Stream[IO, A] =
+    response.body
+      .through(fs2.text.utf8.decode)
+      .through(fs2.text.lines)
+      .filter(_.nonEmpty)
+      .map(decode[A])
+      .collect { case Right(value) => value }
+
+object ReferenceBot:
+
+  /** Initial and maximum pauses between reconnect attempts. The cap is deliberately shared by account and game streams:
+    * an API outage must not turn a fleet into a request storm.
+    */
+  private[refbot] val ReconnectInitialDelay: FiniteDuration = 1.second
+  private[refbot] val ReconnectMaximumDelay: FiniteDuration = 30.seconds
+  private[refbot] val ReconnectJitterFraction: Double       = 0.2
+
+  /** Is a position with `toMove` on the move worth searching?
+    *
+    * The dice are rolled for both sides on the same stream, and a search costs real CPU — under a strategy that
+    * serializes concurrent games behind one model session it also costs queue time that the other games' clocks pay
+    * for. So skip the opponent's rolls: the submission they produce is rejected server-side anyway.
+    *
+    * `ownSeat = None` means the seat could not be resolved, and then this must answer `true`. Correctness never depends
+    * on knowing our colour (the server arbitrates); an unknown seat may only cost the wasted search it was meant to
+    * save, never a missed turn.
+    */
+  private[refbot] def shouldSearch(ownSeat: Option[Seat], toMove: Seat): Boolean = ownSeat.forall(_ == toMove)
+
+  /** A short, log-friendly rendering of a failure. */
+  private[refbot] def describe(error: Throwable): String = error.toString.take(120)
+
+  /** Reject non-successful stream responses before decoding their (usually empty) bodies. Otherwise a revoked token's
+    * 401/403 looks just like a normally closed ndjson stream and is retried forever.
+    */
+  private[refbot] def requireSuccessfulStreamResponse(response: Response[IO], request: Request[IO]): IO[Response[IO]] =
+    if response.status.isSuccess then IO.pure(response)
+    else IO.raiseError(UnexpectedStatus(response.status, request.method, request.uri))
+
+  /** Is `error` worth retrying — a timeout, a network-level `IOException` (connection reset, refused, etc.), or a
+    * temporary 5xx `UnexpectedStatus`? A 4xx or any other failure is definitive.
+    */
+  private[refbot] def isTransient(error: Throwable): Boolean = error match
+    case UnexpectedStatus(status, _, _)                                        => status.code >= 500
+    case _: java.util.concurrent.TimeoutException                              => true
+    case _: java.io.IOException                                                => true
+    case e if e.getClass.getName.contains("EmberException$ReachedEndOfStream") => true
+    case _                                                                     => false
+
+  /** Retry `attempt` indefinitely with capped exponential backoff and jitter while it fails transiently or finishes
+    * normally (e.g. a server deploy). A normal end participates in the same backoff: repeated clean closes while the
+    * API is rolling out must not create a synchronized reconnect storm.
+    */
+  private[refbot] def keepAlive(name: String)(attempt: IO[Boolean]): IO[Unit] =
+    keepAliveWith(name, IO.sleep, () => java.util.concurrent.ThreadLocalRandom.current().nextDouble())(attempt)
+
+  /** Testable form of [[keepAlive]]: callers provide sleeping and entropy so retry sequencing is covered without a live
+    * API or wall-clock waits.
+    */
+  private[refbot] def keepAliveWith(
+      name: String,
+      sleep: FiniteDuration => IO[Unit],
+      random: () => Double
+  )(attempt: IO[Boolean]): IO[Unit] =
+    def loop(delay: FiniteDuration): IO[Unit] =
+      attempt.attempt.flatMap:
+        case Right(true) =>
+          reconnect(name, "ended", delay, sleep, random) *> loop(nextReconnectDelay(delay))
+        case Right(false) =>
+          IO.println(s"[refbot] $name finished and is terminal")
+        case Left(error) if isTransient(error) =>
+          reconnect(name, s"failed transiently (${describe(error)})", delay, sleep, random) *>
+            loop(nextReconnectDelay(delay))
+        case Left(error) =>
+          IO.println(s"[refbot] $name failed (fatal): ${describe(error)}") *>
+            IO.raiseError(error)
+
+    loop(ReconnectInitialDelay)
+
+  /** Pick a bounded jittered delay in the [80%, 120%] interval. The final cap is applied after jitter, not merely to
+    * the un-jittered exponential series, so the configured ceiling remains a real ceiling.
+    */
+  private[refbot] def reconnectDelay(delay: FiniteDuration, random: Double): FiniteDuration =
+    val unit          = random.max(0.0).min(1.0)
+    val multiplier    = 1.0 - ReconnectJitterFraction + unit * 2.0 * ReconnectJitterFraction
+    val jitteredNanos = (delay.toNanos.toDouble * multiplier).toLong
+    math.min(jitteredNanos, ReconnectMaximumDelay.toNanos).nanos
+
+  private[refbot] def nextReconnectDelay(delay: FiniteDuration): FiniteDuration =
+    if delay >= ReconnectMaximumDelay / 2 then ReconnectMaximumDelay else delay * 2
+
+  private def reconnect(
+      name: String,
+      outcome: String,
+      delay: FiniteDuration,
+      sleep: FiniteDuration => IO[Unit],
+      random: () => Double
+  ): IO[Unit] =
+    val actualDelay = reconnectDelay(delay, random())
+    IO.println(s"[refbot] $name $outcome, reconnecting in $actualDelay") *> sleep(actualDelay)
+
+  /** Retry `attempt` with exponential backoff, up to `maxRetries` extra tries, while it keeps failing with a
+    * [[isTransient]] error. A definitive failure or an exhausted retry budget is returned as-is for the caller to
+    * handle.
+    */
+  private[refbot] def withRetries[A](maxRetries: Int, initialDelay: FiniteDuration)(
+      attempt: IO[Either[Throwable, A]]
+  ): IO[Either[Throwable, A]] =
+    def loop(remaining: Int, delay: FiniteDuration): IO[Either[Throwable, A]] =
+      attempt.flatMap:
+        case Right(value)                                       => IO.pure(Right(value))
+        case Left(error) if remaining > 0 && isTransient(error) =>
+          IO.println(s"[refbot] transient failure, retrying in $delay ($remaining left): ${describe(error)}") *>
+            IO.sleep(delay) *> loop(remaining - 1, delay * 2)
+        case left => IO.pure(left)
+
+    loop(maxRetries, initialDelay)
+
+  /** Atomically claim `id` in `inFlight`: `true` if this call added it (the caller now owns starting it), `false` if it
+    * was already claimed by a concurrent caller. Backs [[ReferenceBot.superviseGame]]'s guard against starting
+    * `playGame` twice for the same game when a post-restart listing and a live event both name it.
+    */
+  private[refbot] def claim(inFlight: Ref[IO, Set[String]], id: String): IO[Boolean] =
+    inFlight.modify(ids => if ids.contains(id) then (ids, false) else (ids + id, true))

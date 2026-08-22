@@ -1,0 +1,23 @@
+# Pinned project name so the stack is stable regardless of the deploy directory.
+name: dicechess-reference-bot
+
+services:
+  bot:
+    # Tag is overridable: prod pins BOT_TAG=vX.Y.Z, unset defaults to :latest.
+    image: ghcr.io/fortemate/dicechess-reference-bot:${BOT_TAG:-latest}
+    restart: always
+    env_file:
+      - .env
+    environment:
+      # Point at the play-api (on the homelab, the play-api service/host); the token must match a
+      # PLAY_BOT_TOKENS entry on the server.
+      PLAY_API_BASE_URL: ${PLAY_API_BASE_URL:-https://api.fortemate.com}
+      BOT_TOKEN: ${BOT_TOKEN:-}
+      BOT_ALGORITHM: ${BOT_ALGORITHM:-greedy}
+      # Standing lobby seeks: keep N open offers so humans always find the reference bot to play.
+      BOT_OPEN_SEEKS: ${BOT_OPEN_SEEKS:-2}
+      BOT_SEEK_TIME_CONTROL: ${BOT_SEEK_TIME_CONTROL:-10+10}
+      OPENING_BOOK_PATH: ${OPENING_BOOK_PATH:-}
+      JAVA_OPTS: "-Dcats.effect.warnOnNonMainThreadDetected=false --sun-misc-unsafe-memory-access=allow"
+    # volumes:
+    #   - ./sample_opening_book.tsv:/app/book.tsv:ro
