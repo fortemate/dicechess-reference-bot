@@ -1,6 +1,6 @@
 organization := "com.fortemate"
 version      := "0.1.0-SNAPSHOT"
-scalaVersion := "3.8.4"
+scalaVersion := "3.9.0"
 
 description := "Reference bot for the Dice Chess Bot API (JVM, wraps the engine)."
 
