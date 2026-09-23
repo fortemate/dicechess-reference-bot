@@ -34,8 +34,8 @@ sbt "clean; coverage; test; coverageReport"
 
 [tasks.format]
 description = "🎨 Format code with scalafmt"
-run = "sbt scalafmtAll scalafmtSbt"
+run = "sbt 'scalafmtAll; scalafmtSbt'"
 
 [tasks."format:check"]
 description = "🔍 Check code formatting with scalafmt"
-run = "sbt scalafmtCheckAll scalafmtSbtCheck"
+run = "sbt 'scalafmtCheckAll; scalafmtSbtCheck'"

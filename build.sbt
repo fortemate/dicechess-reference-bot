@@ -21,7 +21,8 @@ credentials ++= (for {
   user = sys.env.get("GITHUB_ACTOR").filter(_.nonEmpty).getOrElse("git")
 } yield Credentials("GitHub Package Registry", "maven.pkg.github.com", user, token)).toSeq
 
-val DiceChessEngineVersion = "0.12.0"
+
+val DiceChessEngineVersion = "0.12.2"
 val CatsEffectVersion      = "3.7.1"
 val Fs2Version             = "3.14.0"
 val Http4sVersion          = "0.23.30"
@@ -37,10 +38,10 @@ lazy val root = (project in file("."))
     Compile / mainClass := Some("dicechess.refbot.Main"),
     libraryDependencies ++= Seq(
       // Game rules: the engine is the single source of truth (resolved from GitHub Packages)
-      "com.fortemate" %% "dicechess-engine"    % DiceChessEngineVersion,
+      "com.fortemate" %% "dicechess-engine" % DiceChessEngineVersion,
       // Effect system + streaming
-      "org.typelevel" %% "cats-effect"         % CatsEffectVersion,
-      "co.fs2"        %% "fs2-core"            % Fs2Version,
+      "org.typelevel" %% "cats-effect" % CatsEffectVersion,
+      "co.fs2"        %% "fs2-core"    % Fs2Version,
       // HTTP client + JSON (talks to the Bot API: ndjson streams + REST)
       "org.http4s"    %% "http4s-ember-client" % Http4sVersion,
       "org.http4s"    %% "http4s-dsl"          % Http4sVersion,
@@ -50,8 +51,8 @@ lazy val root = (project in file("."))
       "io.circe"      %% "circe-parser"        % CirceVersion,
       "ch.qos.logback" % "logback-classic"     % LogbackVersion % Runtime,
       // Testing
-      "org.scalameta" %% "munit"               % MunitVersion           % Test,
-      "org.typelevel" %% "munit-cats-effect"   % MunitCatsEffectVersion % Test
+      "org.scalameta" %% "munit"             % MunitVersion           % Test,
+      "org.typelevel" %% "munit-cats-effect" % MunitCatsEffectVersion % Test
     ),
     scalacOptions ++= Seq("-Werror", "-Wunused:all", "-deprecation", "-feature", "-explain"),
     coverageExcludedFiles := ".*Main\\.scala",
