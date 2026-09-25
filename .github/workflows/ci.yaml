@@ -8,6 +8,7 @@ on:
       - "build.sbt"
       - "project/**"
       - ".scalafmt.conf"
+      - "mise.toml"
       - ".github/workflows/ci.yaml"
   pull_request:
     paths:
@@ -15,6 +16,7 @@ on:
       - "build.sbt"
       - "project/**"
       - ".scalafmt.conf"
+      - "mise.toml"
       - ".github/workflows/ci.yaml"
 
 permissions:
@@ -40,8 +42,23 @@ jobs:
       - name: Setup sbt
         uses: sbt/setup-sbt@v1
 
+      # Mirrors `mise run check`; invoked directly so the CI job only needs the JVM
+      # toolchain instead of the full local tool set from mise.toml. Keep the two in step.
+      #
+      # `testOnly *` rather than `test`: sbt 2's `test` is incremental and its skip-state
+      # outlives `clean`, so a second run over unchanged sources prints "No tests to run
+      # for Test / testQuick", reports `Passed: Total 0` and still exits 0. `ubuntu-latest`
+      # is no protection: `sbt/setup-sbt` caches `$HOME/.cache/sbt` — sbt 2's
+      # `localCacheDirectory` — under a key that does not depend on the repository sources,
+      # so that skip-state is restored across jobs, branches and pull requests. The
+      # throwaway per-workspace localcache keeps one job's skip-state out of the next;
+      # `sbt shutdown` drops a stale server holding a frozen environment.
       - name: Run validation (format, coverage, tests)
-        run: sbt "scalafmtCheckAll; clean; coverage; test; coverageReport"
+        run: |
+          sbt --version
+          sbt shutdown
+          rm -rf target/covcache
+          sbt -Dsbt.global.localcache="$PWD/target/covcache" "scalafmtCheckAll; clean; coverage; testOnly *; coverageReport"
         env:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.READ_PACKAGES_TOKEN || secrets.GITHUB_TOKEN }}
