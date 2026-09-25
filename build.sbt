@@ -21,7 +21,6 @@ credentials ++= (for {
   user = sys.env.get("GITHUB_ACTOR").filter(_.nonEmpty).getOrElse("git")
 } yield Credentials("GitHub Package Registry", "maven.pkg.github.com", user, token)).toSeq
 
-
 val DiceChessEngineVersion = "0.12.2"
 val CatsEffectVersion      = "3.7.1"
 val Fs2Version             = "3.14.0"
@@ -56,7 +55,12 @@ lazy val root = (project in file("."))
     ),
     scalacOptions ++= Seq("-Werror", "-Wunused:all", "-deprecation", "-feature", "-explain"),
     coverageExcludedFiles := ".*Main\\.scala",
-    coverageFailOnMinimum := false,
-    Test / fork           := true,
-    Test / exportJars     := false
+    // Second line of defence behind `testOnly *`. The full suite measures 68.22% statement
+    // coverage over 37 tests; a floor just under that turns a silently partial run into a red
+    // gate rather than a green one (the runs that executed no suite at all reported 0.00%).
+    // Raise the floor as real coverage climbs; never lower it to make a red build green.
+    coverageMinimumStmtTotal := 67,
+    coverageFailOnMinimum    := true,
+    Test / fork              := true,
+    Test / exportJars        := false
   )
