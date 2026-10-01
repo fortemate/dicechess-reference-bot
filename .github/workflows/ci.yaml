@@ -58,7 +58,7 @@ jobs:
           sbt --version
           sbt shutdown
           rm -rf target/covcache
-          sbt -Dsbt.global.localcache="$PWD/target/covcache" "scalafmtCheckAll; clean; coverage; testOnly *; coverageReport"
+          sbt -Dsbt.global.localcache="$PWD/target/covcache" "scalafmtCheckAll; scalafmtSbtCheck; clean; coverage; testOnly *; coverageReport"
         env:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.READ_PACKAGES_TOKEN || secrets.GITHUB_TOKEN }}

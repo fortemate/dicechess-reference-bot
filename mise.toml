@@ -1,6 +1,6 @@
 [tools]
 java = "temurin-25"
-sbt = "2.0.8" # sbt runner; MUST match sbt.version in project/build.properties (also provisions the Jules VM)
+sbt = "2.0.9" # sbt runner; MUST match sbt.version in project/build.properties (also provisions the Jules VM)
 scalafmt = "3.11.4"
 actionlint = "1.7.12"
 betterleaks = "latest"
@@ -34,7 +34,7 @@ description = "✅ Run full validation (format check + clean + test + coverage)"
 # `testOnly *`, not `test`: sbt 2's `test` skips a repeat run over unchanged sources and its
 # skip-state outlives `clean`, so the second run reports `Passed: Total 0` and exits 0. The
 # throwaway per-workspace localcache stops one run's skip-state leaking into the next.
-run = 'sbt shutdown && rm -rf target/covcache && sbt -Dsbt.global.localcache="$PWD/target/covcache" "scalafmtCheckAll; clean; coverage; testOnly *; coverageReport"'
+run = 'sbt shutdown && rm -rf target/covcache && sbt -Dsbt.global.localcache="$PWD/target/covcache" "scalafmtCheckAll; scalafmtSbtCheck; clean; coverage; testOnly *; coverageReport"'
 
 [tasks.format]
 description = "🎨 Format code with scalafmt"
