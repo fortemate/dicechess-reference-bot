@@ -21,7 +21,7 @@ credentials ++= (for {
   user = sys.env.get("GITHUB_ACTOR").filter(_.nonEmpty).getOrElse("git")
 } yield Credentials("GitHub Package Registry", "maven.pkg.github.com", user, token)).toSeq
 
-val DiceChessEngineVersion = "0.14.8"
+val DiceChessEngineVersion = "0.14.9"
 val CatsEffectVersion      = "3.7.1"
 val Fs2Version             = "3.14.0"
 val Http4sVersion          = "0.23.30"
