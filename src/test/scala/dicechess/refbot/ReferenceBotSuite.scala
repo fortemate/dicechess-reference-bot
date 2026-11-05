@@ -31,7 +31,12 @@ class ReferenceBotSuite extends munit.CatsEffectSuite:
 
   // ── withRetries (#47 review: bounded retries for the resumeGames lookup) ────
 
-  private val notFound = UnexpectedStatus(Status.NotFound, GET, Uri.unsafeFromString("http://localhost/x"))
+  private val notFound         = UnexpectedStatus(Status.NotFound, GET, Uri.unsafeFromString("http://localhost/x"))
+  private val ConnectionReset  = "connection reset"
+  private val AccountConnected = "account-connected"
+  private val BotGamesCalled   = "bot-games-called"
+  private val SeedG1           = "seed:g1"
+  private val GameStreamG1     = "game-stream:g1"
 
   test("withRetries returns success on the first attempt without retrying"):
     for
@@ -48,7 +53,7 @@ class ReferenceBotSuite extends munit.CatsEffectSuite:
       attempts <- Ref.of[IO, Int](0)
       result   <- ReferenceBot.withRetries[Int](maxRetries = 3, initialDelay = 1.millis):
         attempts.updateAndGet(_ + 1).map { n =>
-          if n < 3 then Left(new java.io.IOException("connection reset")) else Right(n)
+          if n < 3 then Left(new java.io.IOException(ConnectionReset)) else Right(n)
         }
       count <- attempts.get
     yield
@@ -82,7 +87,7 @@ class ReferenceBotSuite extends munit.CatsEffectSuite:
       attempts <- Ref.of[IO, Int](0)
       done     <- IO.deferred[Unit]
       stream = attempts.updateAndGet(_ + 1).flatMap { n =>
-        if n == 1 then IO.raiseError(new java.io.IOException("connection reset"))
+        if n == 1 then IO.raiseError(new java.io.IOException(ConnectionReset))
         else if n == 2 then IO.pure(true) // normal completion
         else done.complete(()).as(false)  // third attempt, stop
       }
@@ -186,9 +191,9 @@ class ReferenceBotSuite extends munit.CatsEffectSuite:
       val path = req.uri.path.toString
       (req.method, path) match
         case (GET, p) if p.endsWith("/bot/stream/event") =>
-          Resource.eval(order.update(_ :+ "account-connected")).as(Response[IO](body = accountBody))
+          Resource.eval(order.update(_ :+ AccountConnected)).as(Response[IO](body = accountBody))
         case (GET, p) if p.endsWith("/bot/games") =>
-          Resource.eval(order.update(_ :+ "bot-games-called") *> games).map(g => Response[IO](Status.Ok).withEntity(g))
+          Resource.eval(order.update(_ :+ BotGamesCalled) *> games).map(g => Response[IO](Status.Ok).withEntity(g))
         case (POST, seedPath(gameId)) =>
           Resource.eval(order.update(_ :+ s"seed:$gameId")).as(Response[IO](Status.Ok))
         case (GET, p) if p.contains("/bot/game/stream/") =>
@@ -215,7 +220,7 @@ class ReferenceBotSuite extends munit.CatsEffectSuite:
         val bot = ReferenceBot(testConfig, client, supervisor, NoOpStrategy)
         bot.run.start.flatMap(fiber => IO.sleep(1500.millis) *> fiber.cancel)
       recorded <- order.get
-    yield assertEquals(recorded, List("account-connected", "bot-games-called"))
+    yield assertEquals(recorded, List(AccountConnected, BotGamesCalled))
 
   test("supervises playGame at most once when resumeGames and a live GameStart name the same game"):
     val gameStartLine = Stream.emit((BotEvent.GameStart("g1"): BotEvent).asJson.noSpaces + "\n")
@@ -227,18 +232,18 @@ class ReferenceBotSuite extends munit.CatsEffectSuite:
         val bot = ReferenceBot(testConfig, client, supervisor, NoOpStrategy)
         bot.run.start.flatMap(fiber => IO.sleep(1500.millis) *> fiber.cancel)
       recorded <- order.get
-    yield assertEquals(recorded.count(_ == "seed:g1"), 1)
+    yield assertEquals(recorded.count(_ == SeedG1), 1)
 
   test("run reconnects the account stream on a transient drop without killing in-flight games (#53)"):
     val gameStartLine = Stream.emit((BotEvent.GameStart("g1"): BotEvent).asJson.noSpaces + "\n")
     val accountBody   = gameStartLine.through(fs2.text.utf8.encode)
       ++ Stream.sleep_[IO](50.millis)
-      ++ Stream.raiseError[IO](new java.io.IOException("connection reset"))
+      ++ Stream.raiseError[IO](new java.io.IOException(ConnectionReset))
 
     for
       order <- Ref.of[IO, List[String]](Nil)
       games = order.get.map { rec =>
-        if rec.contains("seed:g1") then BotGames(List(BotActiveGame("g1", Seat.White)))
+        if rec.contains(SeedG1) then BotGames(List(BotActiveGame("g1", Seat.White)))
         else BotGames(Nil)
       }
       // The side effect fires after the maximum 1.2s first reconnect delay (plus the 50ms drop), so it proves the
@@ -251,13 +256,13 @@ class ReferenceBotSuite extends munit.CatsEffectSuite:
       recorded <- order.get
     yield
       val expected = List(
-        "account-connected",
-        "bot-games-called",
-        "seed:g1",
-        "bot-games-called",
-        "game-stream:g1",    // started immediately after seed
-        "account-connected", // reconnects after 1 second
-        "bot-games-called",
+        AccountConnected,
+        BotGamesCalled,
+        SeedG1,
+        BotGamesCalled,
+        GameStreamG1,     // started immediately after seed
+        AccountConnected, // reconnects after 1 second
+        BotGamesCalled,
         "game-g1-still-alive" // side effect executes AFTER reconnect proving fiber survived
       )
       assertEquals(recorded, expected)
@@ -265,7 +270,7 @@ class ReferenceBotSuite extends munit.CatsEffectSuite:
   test("playGame reconnects its per-game stream on a transient drop without re-seeding (#53)"):
     val gameStartLine = Stream.emit((BotEvent.GameStart("g1"): BotEvent).asJson.noSpaces + "\n")
     val accountBody   = gameStartLine.through(fs2.text.utf8.encode) ++ Stream.never[IO]
-    val gameBody = Stream.sleep_[IO](50.millis) ++ Stream.raiseError[IO](new java.io.IOException("connection reset"))
+    val gameBody      = Stream.sleep_[IO](50.millis) ++ Stream.raiseError[IO](new java.io.IOException(ConnectionReset))
 
     for
       order <- Ref.of[IO, List[String]](Nil)
@@ -276,12 +281,12 @@ class ReferenceBotSuite extends munit.CatsEffectSuite:
       recorded <- order.get
     yield
       val expected = List(
-        "account-connected",
-        "bot-games-called",
-        "seed:g1",
-        "bot-games-called",
-        "game-stream:g1",
-        "game-stream:g1"
+        AccountConnected,
+        BotGamesCalled,
+        SeedG1,
+        BotGamesCalled,
+        GameStreamG1,
+        GameStreamG1
       )
       assertEquals(recorded, expected)
 
@@ -301,11 +306,11 @@ class ReferenceBotSuite extends munit.CatsEffectSuite:
       recorded <- order.get
     yield
       val expected = List(
-        "account-connected",
-        "bot-games-called",
-        "seed:g1",
-        "bot-games-called",
-        "game-stream:g1"
+        AccountConnected,
+        BotGamesCalled,
+        SeedG1,
+        BotGamesCalled,
+        GameStreamG1
       )
       assertEquals(recorded, expected)
 
